@@ -1,0 +1,17 @@
+// Waybar custom module for agent-control-shell. Add to your bar's "modules-right".
+// `acs status --format waybar` prints {"text","alt","class","tooltip"}; the class is the
+// scope (none | t1 | t2 | shell) so CSS can colour it. Left = grant menu is the tray's job;
+// here: click = status in a terminal, middle = end the lease (no password).
+"custom/acs": {
+    "exec": "acs status --format waybar",
+    "return-type": "json",
+    "interval": 1,
+    "format": "{}",
+    "on-click": "x-terminal-emulator -e bash -c 'acs status; read -rp \"enter to close \"'",
+    "on-click-middle": "acs end",
+    "tooltip": true
+}
+// style.css:
+// #custom-acs.t1, #custom-acs.t2 { color: #e5a02e; }
+// #custom-acs.shell               { color: #e04b4b; font-weight: bold; }
+// #custom-acs.none                { color: #7a7f8a; }

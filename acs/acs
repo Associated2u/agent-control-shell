@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# acs — agent-control-shell: the user-side face of the leased root shell.
+#
+#   acs status [--format text|json|waybar|polybar|i3]   what is armed, how long is left
+#   acs grant <t1|t2|shell> <minutes> [note...]         arm a lease (password: yours, always)
+#   acs end                                             end it, no password (mrog-lease-kill)
+#   acs journal [N]                                     last N journalled actions (default 20)
+#   acs run <command...>                                arbitrary root under a SHELL lease
+#   acs tray                                            start the tray icon (see acs-tray.py)
+#
+# This script holds NO privilege. Granting goes through sudo (a tty) or polkit (no tty);
+# ending goes through the delete-only NOPASSWD kill helper and falls back to polkit. The
+# policy, the lease file and the journal all belong to the root layer (mrog-lease,
+# mrog-apply, /etc/mrog) — this is the panel-facing wrapper that any bar or tray can call.
+set -uo pipefail
+LEASE="${ACS_LEASE:-/run/mrog/lease.json}"
+KILL=/usr/local/sbin/mrog-lease-kill
+GRANT=/usr/local/sbin/mrog-lease
+UI=/usr/local/sbin/mrog-lease-ui
+
+read_lease() {   # -> prints "scope left expires_at granted_by note" or "none"
+  python3 - "$LEASE" <<'PY'
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))
+    left = int(d.get("expires_at", 0) - time.time())
+    if left <= 0: print("none"); sys.exit(0)
+    print(json.dumps({"scope": d.get("scope", "?"), "left": left,
+                      "expires_at": int(d.get("expires_at", 0)),
+                      "granted_at": int(d.get("granted_at", 0)),
+                      "by": d.get("granted_by", "?"), "note": d.get("note") or ""}))
+except Exception:
+    print("none")
+PY
+}
+
+fmt_left() { printf '%d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
+
+status() {
+  local format=text
+  [ "${1:-}" = --format ] && format="${2:-text}"
+  local j; j="$(read_lease)"
+  if [ "$j" = none ]; then
+    case "$format" in
+      text)    echo "no lease" ;;
+      json)    echo '{"state":"none","left":0}' ;;
+      waybar)  echo '{"text":"","alt":"none","class":"none","tooltip":"agent-control-shell: no lease"}' ;;
+      polybar) echo '%{F#7a7f8a}○%{F-}' ;;
+      i3)      echo "" ;;
+      *) echo "acs: unknown format $format"; return 2 ;;
+    esac; return 0
+  fi
+  local scope left by note m
+  scope=$(printf '%s' "$j" | python3 -c 'import json,sys;print(json.load(sys.stdin)["scope"])')
+  left=$(printf '%s'  "$j" | python3 -c 'import json,sys;print(json.load(sys.stdin)["left"])')
+  by=$(printf '%s'    "$j" | python3 -c 'import json,sys;print(json.load(sys.stdin)["by"])')
+  note=$(printf '%s'  "$j" | python3 -c 'import json,sys;print(json.load(sys.stdin)["note"])')
+  m=$(fmt_left "$left")
+  local colour="#e5a02e"; [ "$scope" = shell ] && colour="#e04b4b"
+  case "$format" in
+    text)    printf '%s · %s left · by %s%s\n' "$scope" "$m" "$by" "${note:+ · $note}" ;;
+    json)    printf '%s' "$j" | python3 -c 'import json,sys;d=json.load(sys.stdin);d["state"]=d["scope"];print(json.dumps(d))' ;;
+    waybar)  python3 -c 'import json,sys;print(json.dumps({"text":sys.argv[1]+" "+sys.argv[2],"alt":sys.argv[1],"class":sys.argv[1],"tooltip":sys.argv[3]}))' \
+               "$scope" "$m" "agent-control-shell: $scope lease, $m left, granted by $by${note:+ — $note}" ;;
+    polybar) printf '%%{F%s}● %s %s%%{F-}\n' "$colour" "$scope" "$m" ;;
+    i3)      printf '● %s %s\n' "$scope" "$m" ;;
+    *) echo "acs: unknown format $format"; return 2 ;;
+  esac
+}
+
+grant() {
+  local scope="${1:-}" mins="${2:-}"; shift 2 2>/dev/null || { echo "usage: acs grant <t1|t2|shell> <minutes> [note...]"; return 2; }
+  case "$scope" in t1|t2|shell) ;; *) echo "acs: scope must be t1, t2 or shell"; return 2 ;; esac
+  [[ "$mins" =~ ^[0-9]+$ ]] || { echo "acs: minutes must be a number"; return 2; }
+  local note="${*:-granted via acs}"
+  if [ -t 0 ]; then
+    # A terminal: sudo asks for the password right here and the note is yours.
+    exec sudo "$GRANT" grant "$mins" --scope "$scope" --note "$note"
+  else
+    # No terminal (tray, panel click): polkit puts up the dialog. Same ceilings as the dot.
+    exec pkexec "$UI" root "$mins" "$scope"
+  fi
+}
+
+end() {
+  # Free first; the dialog only if the kill helper is not installed.
+  if sudo -n "$KILL" 2>/dev/null; then return 0; fi
+  if [ -t 0 ]; then exec sudo "$GRANT" revoke; else exec pkexec "$UI" revoke; fi
+}
+
+case "${1:-}" in
+  status)  shift; status "$@" ;;
+  grant)   shift; grant "$@" ;;
+  end|revoke|kill) end ;;
+  journal) shift; mrog journal 2>/dev/null | tail -n "${1:-20}" ;;
+  run)     shift; exec mrog run "$@" ;;
+  tray)    exec "$(dirname "$(readlink -f "$0")")/acs-tray.py" ;;
+  ""|-h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "acs: unknown verb $1"; exit 2 ;;
+esac
